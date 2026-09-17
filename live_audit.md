@@ -434,3 +434,27 @@ DEPLOYED (2026-09-10 ~09:50):
   rewritten to match new input names (bools as 0/1) + re-synced to GitHub (Eagoldregression).
 - NOTE: NOT yet validated in tester or deployed live. Ranging-gate is a behavioral change from
   the tuned lrc34 profile (PF ~1.007) - expect fewer trades (strong-trend bars skipped).
+
+## 2026-09-17 ~19:00 - FULL CODE AUDIT + BUGFIX PASS (v6.03)
+Rounds 1-2 audit of refactored EA; fixed flaws:
+1. FATAL Trend-Confluence bug: old gate `if(slope<=0)return; if(slope>=0)return;` blocked ALL entries
+   whenever UseTrendConfluence=on. Now direction-aware (BUY: tf.slope>0, SELL: tf.slope<0).
+2. R-multiple distortion: ManagePositions computed profit in "R" against the LIVE SL distance, which
+   collapses to ~10pt after SL moved to BE -> R could explode, partial/BE fire at wrong price.
+   Now derives ORIGINAL SL distance from TP (|TP-open|/TPRR) -> stable after BE/partial.
+3. Bar-cross gate + exact-entry BE impossible with no handshake: partial/BE now move SL ONLY when
+   profit dist > stopLevel + 10pts (broker freeze-level guard) -> no rejected PositionModify spam.
+4. Instant entry on chart attach: lastBarTime now seeded in OnInit -> first signal only after a
+   real new bar.
+5. ATR<=0 / lot<=0 guards in OpenTrade -> no door-lock trades on empty buffers / zero balance.
+6. ONT KILLED: news JSON dates are ISO "yyyy-mm-dd hh:mm" but MQL5 StringToTime needs
+   "yyyy.mm.dd hh:mm" -> hyphen dates parsed as 0 / wrong -> news filter silently dead. Fixed.
+7. News self-disable: lastNewsFetchTime was stamped even on failure -> dead for 4h. Now retries
+   ~every 10 min (still throttled, no log spam).
+8. Input validation in OnInit (LRC>=3, 0<R2_Max<=1, PartialPct in (0,100], RR/TPRR>0, MaxPos>=1,
+   start/end hours, risk-or-fixed-lot present) + warning when PartialRR<=BERR.
+9. R2 clamped to [0,1] (numeric edge), regression flagged ok=/ only on valid fit (no junk lines).
+10. PartialPct>=100 now means "full close at PartialRR"; partialDone list auto-freed when flat.
+Compile: 0 errors / 0 warnings (ex5 58,234 B, 18:56). NOT yet deployed/backtested.
+NOTE: with RiskPercent=0.5 on the $104 live account, minLotRiskPct (~10%) > 2x cap -> notEnoughMoney
+path BLOCKS all entries there; trades only on >= ~$1,000 balance. Demo (~$5,390) is fine.
