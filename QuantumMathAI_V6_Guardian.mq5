@@ -1,11 +1,11 @@
 ﻿//+------------------------------------------------------------------+
 //|                                   QuantumMathAI_V6_Guardian.mq5  |
-//|          REFACTORED - RANGING-REGIME MEAN-REVERSION SYSTEM       |
-//|     Core fix: block entries in strong trends (R2 >= 0.5) and      |
-//|     replace rigid 1:4 RR with BE + 50% partial + running target.  |
+//|         RANGING-REGIME MEAN-REVERSION (XAUUSD, clean build)      |
+//|      Core: block strong trends (R2 gate), channel-band logical   |
+//|      SL, partial + BE + runner, consecutive-loss circuit breaker |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, Project Quantum"
-#property version   "6.03"
+#property version   "6.05"
 #property strict
 #property description "Quantum Math AI V6 - Ranging Regime Mean Reversion (XAUUSD)"
 
@@ -24,28 +24,27 @@ input group "--- 2. Risk Management ---"
 input double   RiskPercent       = 0.5;    // Risk % per Trade of account balance (0 = Fixed Lot)
 input double   FixedLot          = 0.0;    // Fixed Lot Size (0 = use Risk%)
 input int      ATR_Period        = 14;     // ATR Period
-input double   ATR_Multiplier_SL = 2.0;    // SL Distance = ATR * this
-input double   PartialRR         = 2.0;    // Partial trigger: close % of volume at + this R
-input double   PartialPct        = 50.0;   // Partial close size (percent of position volume)
-input double   BERR               = 1.0;    // Break-even trigger: SL->entry at + this R
-input double   TPRR               = 4.0;    // Remainder runner target: R:R for the open 50%
+input int      SL_Mode           = 1;      // SL Mode: 0=ATR-based, 1=Channel-band logic (recommended)
+input double   ATR_Multiplier_SL = 2.0;    // SL Distance = ATR * this (mode 0 / width reference)
+input double   SL_BandBuffer     = 0.5;    // Band SL buffer beyond the touched band (in ATR)
+input double   PartialRR         = 1.5;    // Partial trigger: close % of volume at + this R
+input double   PartialPct        = 60.0;   // Partial close size (percent of position volume)
+input double   BERR               = 1.0;   // Break-even trigger: SL->entry at + this R
+input double   TPRR               = 2.5;   // Remainder runner target: R:R for the open volume
 input int      MaxPositions      = 1;      // Max concurrent positions
 input int      MaxHoldMinutes    = 480;    // Max hold time in minutes (0=off)
 
 input group "--- 2b. Optional Trend Confluence (keep OFF for pure mean-reversion) ---"
 input bool     UseTrendConfluence = false;  // Require 100-bar regression agreement (BUY: >0, SELL: <0)
 
-input group "--- 3. Auto News Filter (ForexFactory) ---"
-input bool     UseAutoNews       = true;   // Enable Auto-Calendar Fetching
-input bool     IncludeMedium     = false;  // If true, pause on 'Medium' impact too
-input int      PauseMinsBefore   = 30;     // Minutes to pause BEFORE news
-input int      PauseMinsAfter    = 30;     // Minutes to pause AFTER news
-input int      ServerTimeOffset  = 2;      // Broker Timezone Offset from UTC
+input group "--- 3. Loss Control (streak circuit breaker) ---"
+input int      MaxConsecutiveLosses = 3;    // Pause after this many consecutive losses (0=off)
+input int      StreakPauseMinutes   = 60;   // How long the streak pause lasts (minutes)
 
 input group "--- 4. Filters & Time ---"
 input int      MaxSpreadPoints   = 150;    // Max Spread Allowed (points)
 input int      StartHour         = 8;      // Trading Start Hour (Server Time)
-input int      EndHour           = 22;     // Trading End Hour (Server Time, excludes Asian rollover)
+input int      EndHour           = 22;     // Trading End Hour (Server Time)
 
 input group "--- 5. System ---"
 input int      MagicNumber       = 66666;  // Unique Magic Number
@@ -56,12 +55,18 @@ input int      MagicNumber       = 66666;  // Unique Magic Number
 CTrade trade;
 int atrHandle;
 datetime lastBarTime = 0;
-datetime lastNewsFetchTime = 0;
 bool   notEnoughMoney = false;
-ulong  partialDoneTickets[];   // tickets that already fired their partial close
+ulong  partialDoneTickets[];     // tickets that already fired their partial close
+
+// streak circuit breaker state
+int      consecLosses    = 0;    // current consecutive-loss streak
+datetime streakBlockUntil = 0;   // entries blocked until this time
+ulong    lastTrackedPosId = 0;   // last position whose close we counted
+
+string ObjPrefix = "QMAI_V6_";
 
 struct RegressionResult {
-   bool   ok;              // true when the regression could be computed from enough bars
+   bool   ok;              // true when the regression was computed from enough bars
    double slope;
    double intercept;
    double rSquared;
@@ -72,32 +77,25 @@ struct RegressionResult {
    double upperBandPrev;   // upper channel at bar 2
 };
 
-struct NewsEvent {
-   datetime time;
-   string   title;
-   string   impact;
-   string   currency;
-};
-
-NewsEvent WeeklyNews[];
-string ObjPrefix = "QMAI_V6_";
-
 //==================================================================
 // 3. INITIALIZATION
 //==================================================================
 int OnInit() {
-   // ---------------- input validation ----------------
    if(LRC_Period < 3)            { Print("INIT ERROR: LRC_Period must be >= 3");            return(INIT_FAILED); }
    if(Slope_Threshold < 0)       { Print("INIT ERROR: Slope_Threshold must be >= 0");       return(INIT_FAILED); }
    if(R2_Max <= 0 || R2_Max > 1.0){ Print("INIT ERROR: R2_Max must be in (0, 1.0]");         return(INIT_FAILED); }
    if(BandMultiplier <= 0)       { Print("INIT ERROR: BandMultiplier must be > 0");          return(INIT_FAILED); }
    if(RiskPercent < 0)           { Print("INIT ERROR: RiskPercent must be >= 0");            return(INIT_FAILED); }
    if(ATR_Multiplier_SL <= 0)    { Print("INIT ERROR: ATR_Multiplier_SL must be > 0");       return(INIT_FAILED); }
+   if(SL_Mode != 0 && SL_Mode != 1){ Print("INIT ERROR: SL_Mode must be 0 or 1");             return(INIT_FAILED); }
+   if(SL_BandBuffer < 0)          { Print("INIT ERROR: SL_BandBuffer must be >= 0");          return(INIT_FAILED); }
    if(PartialRR <= 0)            { Print("INIT ERROR: PartialRR must be > 0");               return(INIT_FAILED); }
    if(PartialPct <= 0 || PartialPct > 100){ Print("INIT ERROR: PartialPct must be in (0, 100]"); return(INIT_FAILED); }
    if(BERR <= 0)                 { Print("INIT ERROR: BERR must be > 0");                    return(INIT_FAILED); }
    if(TPRR <= 0)                 { Print("INIT ERROR: TPRR must be > 0");                    return(INIT_FAILED); }
    if(MaxPositions < 1)          { Print("INIT ERROR: MaxPositions must be >= 1");           return(INIT_FAILED); }
+   if(MaxConsecutiveLosses < 0)  { Print("INIT ERROR: MaxConsecutiveLosses must be >= 0");   return(INIT_FAILED); }
+   if(StreakPauseMinutes < 0)    { Print("INIT ERROR: StreakPauseMinutes must be >= 0");     return(INIT_FAILED); }
    if(RiskPercent <= 0 && FixedLot <= 0) { Print("INIT ERROR: set RiskPercent > 0 OR FixedLot > 0"); return(INIT_FAILED); }
    if(StartHour < 0 || StartHour > 23 || EndHour < 1 || EndHour > 24)
                                  { Print("INIT ERROR: StartHour/EndHour out of range 0-24");  return(INIT_FAILED); }
@@ -120,10 +118,7 @@ int OnInit() {
 
    lastBarTime = iTime(_Symbol, _Period, 0);   // no entry on the very first attaching tick
 
-   if(UseAutoNews)
-      Print("NOTE: If Auto-News is active, ensure 'Allow WebRequest' is enabled in Tools > Options > Expert Advisors and that https://nfs.faireconomy.media is whitelisted.");
-
-   Print(">>> QuantumMathAI V6.03 REFACTORED (bug-fixed) INITIALIZED (XAUUSD, Ranging Regime)");
+   Print(">>> QuantumMathAI V6.05 CLEAN INITIALIZED (XAUUSD, Ranging Regime)");
    return(INIT_SUCCEEDED);
 }
 
@@ -136,7 +131,7 @@ void OnDeinit(const int reason) {
 //==================================================================
 // 4. MAIN TICK LOOP
 //   - ENTRY evaluated ONLY on a new bar (closed-bar data -> no repaint)
-//   - MENT management runs on every tick but only touches thresholds
+//   - Management runs on every tick but only touches thresholds
 //==================================================================
 void OnTick() {
    MqlTick tick;
@@ -147,18 +142,18 @@ void OnTick() {
    double currentATR = GetCurrentATR();
 
    DrawChannel(math);
-   bool isNews = CheckNewsFilter();
-   UpdateDashboard(math, currentATR, isNews);
+   UpdateStreakTracker();
+   UpdateDashboard(math, currentATR);
 
-   // Management (BE / partial / max-hold) - every tick, threshold-based
+   // Management (BE / partial / max-hold) - every tick
    ManagePositions();
 
    // --- ENTRY BLOCK - new bar only ---------------------------------
    if(!CheckTimeFilter()) return;
+   if(MaxConsecutiveLosses > 0 && TimeCurrent() < streakBlockUntil) return;  // streak cooldown
    if(!isNewBar()) return;
    if(CountMyPositions() >= MaxPositions) return;
    if((int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) > MaxSpreadPoints) return;
-   if(isNews) return;
 
    // Closed-bar reference data (bar 2 and bar 1)
    double close2 = iClose(_Symbol, _Period, 2);
@@ -183,23 +178,17 @@ void OnTick() {
 
    // BUY: bar 2 closed BELOW lower band AND bar 1 closed ABOVE lower band (reversal back inside)
    if(close2 < math.lowerBandPrev && close1 > math.lowerBand) {
-      if(allowBuy) OpenTrade(ORDER_TYPE_BUY, currentATR);
+      if(allowBuy) OpenTrade(ORDER_TYPE_BUY, currentATR, math.lowerBand);
       return;
    }
    // SELL: bar 2 closed ABOVE upper band AND bar 1 closed BELOW upper band (reversal back inside)
    if(close2 > math.upperBandPrev && close1 < math.upperBand) {
-      if(allowSell) OpenTrade(ORDER_TYPE_SELL, currentATR);
+      if(allowSell) OpenTrade(ORDER_TYPE_SELL, currentATR, math.upperBand);
    }
 }
 
 //==================================================================
 // 5. MATH CORE - LINEAR REGRESSION (N=34, y=Close, x anchored at bar 1)
-//   slope     = (N*SumXY - SumX*SumY) / (N*SumX2 - (SumX)^2)
-//   intercept = (SumY - slope*SumX) / N
-//   R^2       = (N*SumXY - SumX*SumY)^2 /
-//               [(N*SumX2 - (SumX)^2) * (N*SumY2 - (SumY)^2)]
-//   StdDev    = sqrt( (1/N) * Sum( (yi - (m*xi + b))^2 ) )
-//   bands     = regression value at bar +/- BandMultiplier * StdDev
 //==================================================================
 RegressionResult CalculateRegression(int n) {
    RegressionResult res;
@@ -212,7 +201,7 @@ RegressionResult CalculateRegression(int n) {
    double sumX=0, sumY=0, sumXY=0, sumX2=0, sumY2=0;
    for(int i=0; i<n; i++) {
       double x = -((double)i);                         // bar 1 -> x=0, bar 2 -> x=-1, ...
-      double y = prices[i];                            // closes of bar1..barN
+      double y = prices[i];
       sumX  += x;
       sumY  += y;
       sumXY += x*y;
@@ -253,110 +242,93 @@ RegressionResult CalculateRegression(int n) {
 }
 
 //==================================================================
-// 6. AUTO NEWS FILTER LOGIC (WEB REQUEST)
+// 6. STREAK CIRCUIT BREAKER
+//   Counts fully-closed position results (net of partials/SL/TP).
+//   After MaxConsecutiveLosses losses in a row, entries pause for
+//   StreakPauseMinutes - cuts the destructive loss streaks down.
 //==================================================================
-bool CheckNewsFilter() {
-   if(!UseAutoNews) return false;
+void UpdateStreakTracker() {
+   if(!HistorySelect(0, TimeCurrent())) return;
+   int n = HistoryDealsTotal();
 
-   if(TimeCurrent() - lastNewsFetchTime > 14400) {
-      FetchNewsData();
-   }
+   for(int i = n - 1; i >= 0; i--) {                   // walk backwards to the newest deal
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+      if((long)HistoryDealGetInteger(ticket, DEAL_MAGIC) != (long)MagicNumber) continue;
+      if((int)HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
 
-   datetime now = TimeCurrent();
-   for(int i=0; i<ArraySize(WeeklyNews); i++) {
-      if(WeeklyNews[i].currency != "USD") continue;
+      ulong posId = HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
+      if(posId == 0 || posId == lastTrackedPosId) return;
 
-      bool isHigh   = (StringFind(WeeklyNews[i].impact, "High") >= 0);
-      bool isMedium = (StringFind(WeeklyNews[i].impact, "Medium") >= 0);
-
-      if(!isHigh && (!IncludeMedium || !isMedium)) continue;
-
-      long diff = (long)now - (long)WeeklyNews[i].time;
-      if(diff >= -PauseMinsBefore*60 && diff <= PauseMinsAfter*60) {
-         return true;
-      }
-   }
-   return false;
-}
-
-void FetchNewsData() {
-   string cookie=NULL, headers;
-   char post[], result[];
-   string url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
-
-   int res = WebRequest("GET", url, cookie, NULL, 500, post, 0, result, headers);
-
-   if(res == 200) {
-      lastNewsFetchTime = TimeCurrent();
-      string json = CharArrayToString(result);
-      ParseNewsJson(json);
-      Print(">>> News Data Fetched Successfully. Total Events: ", ArraySize(WeeklyNews));
-   } else {
-      // Do NOT self-disable for 4h on a transient failure: schedule a retry in ~10 min.
-      // (WebRequest -1 = not allowed -> keep throttled but not dead; 400+ = server hiccup)
-      if(TimeCurrent() - lastNewsFetchTime > 600)
-         lastNewsFetchTime = TimeCurrent() - 13800;
-      Print(">>> Error fetching news. Code: ", res, ". Check 'Allow WebRequest' in Options.");
-   }
-}
-
-void ParseNewsJson(string json) {
-   ArrayResize(WeeklyNews, 0);
-
-   string objects[];
-   StringSplit(json, '}', objects);
-
-   for(int i=0; i<ArraySize(objects); i++) {
-      string obj = objects[i];
-      if(StringFind(obj, "\"country\":\"USD\"") < 0) continue;
-
-      string impact = "";
-      if(StringFind(obj, "\"impact\":\"High\"") >= 0) impact = "High";
-      else if(StringFind(obj, "\"impact\":\"Medium\"") >= 0) impact = "Medium";
-
-      if(impact == "") continue;
-
-      int dateStart = StringFind(obj, "\"date\":\"");
-      if(dateStart < 0) continue;
-
-      string dateStr = StringSubstr(obj, dateStart + 8, 19);
-      StringReplace(dateStr, "T", " ");          // "2026-09-17 13:30:00" (ISO)
-      StringReplace(dateStr, "-", ".");          // MQL5 StringToTime needs "yyyy.mm.dd hh:mm"
-
-      datetime newsTime = StringToTime(dateStr);
-      newsTime = newsTime + (ServerTimeOffset * 3600);
-
-      int titleStart = StringFind(obj, "\"title\":\"");
-      string title = "News";
-      if(titleStart >= 0) {
-         int titleEnd = StringFind(obj, "\"", titleStart + 9);
-         title = StringSubstr(obj, titleStart + 9, titleEnd - (titleStart + 9));
+      // Sum IN/OUT volume and net P/L (spread-sway, swap, commission)
+      double vIn = 0, vOut = 0, pl = 0;
+      for(int j = 0; j < n; j++) {
+         ulong t2 = HistoryDealGetTicket(j);
+         if(t2 == 0) continue;
+         if(HistoryDealGetInteger(t2, DEAL_POSITION_ID) != posId) continue;
+         if(HistoryDealGetString(t2, DEAL_SYMBOL) != _Symbol) continue;
+         if((long)HistoryDealGetInteger(t2, DEAL_MAGIC) != (long)MagicNumber) continue;
+         long entry = HistoryDealGetInteger(t2, DEAL_ENTRY);
+         if(entry == DEAL_ENTRY_IN)       vIn  += HistoryDealGetDouble(t2, DEAL_VOLUME);
+         else if(entry == DEAL_ENTRY_OUT) vOut += HistoryDealGetDouble(t2, DEAL_VOLUME);
+         pl += HistoryDealGetDouble(t2, DEAL_PROFIT)
+             + HistoryDealGetDouble(t2, DEAL_SWAP)
+             + HistoryDealGetDouble(t2, DEAL_COMMISSION);
       }
 
-      int newIdx = ArrayResize(WeeklyNews, ArraySize(WeeklyNews) + 1);
-      WeeklyNews[newIdx-1].time    = newsTime;
-      WeeklyNews[newIdx-1].impact  = impact;
-      WeeklyNews[newIdx-1].currency= "USD";
-      WeeklyNews[newIdx-1].title   = title;
+      if(vOut < vIn) return;                            // only partial-closed so far -> wait
+
+      lastTrackedPosId = posId;                          // fully closed: update the streak
+      if(pl >= 0) {
+         if(consecLosses > 0)
+            Print(">>> Streak reset after a winning position (was ", consecLosses, " losses).");
+         consecLosses = 0;
+      } else {
+         consecLosses++;
+         if(MaxConsecutiveLosses > 0 && consecLosses >= MaxConsecutiveLosses) {
+            streakBlockUntil = (datetime)((ulong)TimeCurrent() + (ulong)StreakPauseMinutes * 60);
+            Print(">>> ", MaxConsecutiveLosses, " consecutive losses reached. Entries paused ",
+                  StreakPauseMinutes, " min (until ", TimeToString(streakBlockUntil), ").");
+         }
+      }
+      return;
    }
 }
 
 //==================================================================
 // 7. EXECUTION & LOT SIZING (RiskPercent = 0.5% of balance)
 //==================================================================
-void OpenTrade(ENUM_ORDER_TYPE type, double atr) {
+void OpenTrade(ENUM_ORDER_TYPE type, double atr, double band) {
    if(atr <= 0) return;                        // ATR buffer not ready -> no trade
    double price = (type == ORDER_TYPE_BUY)
                   ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                   : SymbolInfoDouble(_Symbol, SYMBOL_BID);
    if(price <= 0) return;
 
-   // --- Stop Loss: ATR(14) * ATR_Multiplier_SL, floored ---
-   double slDist = atr * ATR_Multiplier_SL;
-   if(slDist < 200 * _Point) slDist = 200 * _Point;
+   // --- Stop Loss -------------------------------------------------
+   // Mode 1 (LOGICAL channel SL): the mean-reversion thesis is invalidated when price
+   // keeps going away and breaks back through the band that triggered the entry.
+   // SL sits just beyond that touched band + a small ATR buffer, floored by broker
+   // stop level and capped to never be absurdly wide.
+   double slDist = 0;
+   if(SL_Mode == 1) {
+      double bandDist = (type == ORDER_TYPE_BUY) ? (price - band) : (band - price);
+      if(bandDist < 0) bandDist = 0;
+      slDist = bandDist + SL_BandBuffer * atr;
+      double stopLvl   = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+      double floorDist = MathMax(stopLvl + 20 * _Point, 200 * _Point);
+      if(slDist < floorDist) slDist = floorDist;
+      double maxDist   = atr * ATR_Multiplier_SL * 1.5;
+      if(maxDist > 0 && slDist > maxDist) slDist = maxDist;
+   }
+   if(slDist <= 0) {                                          // Mode 0 (ATR-based, or fallback)
+      slDist = atr * ATR_Multiplier_SL;
+      if(slDist < 200 * _Point) slDist = 200 * _Point;
+   }
    double sl = (type == ORDER_TYPE_BUY) ? price - slDist : price + slDist;
 
-   // --- Target for the running 50% ---
+   // --- Target for the runner ---
    double tpDist = slDist * TPRR;
    double tp = (type == ORDER_TYPE_BUY) ? price + tpDist : price - tpDist;
 
@@ -460,7 +432,7 @@ void ManagePositions() {
 
       double dist = MathAbs(currentPrice - openPrice);
 
-      // R-reference = ORIGINAL SL distance, recovered from the TP (stable even after the
+      // R-reference = ORIGINAL SL distance, recovered from TP (stable even after the
       // SL was moved to break-even, where the live SL distance would otherwise collapse).
       double initialSlDist = 0;
       if(TPRR > 0 && tp > 0) initialSlDist = MathAbs(tp - openPrice) / TPRR;
@@ -538,8 +510,8 @@ void ManagePositions() {
 //==================================================================
 // 8. UTILITIES & VISUALS
 //==================================================================
-void UpdateDashboard(RegressionResult &m, double atr, bool newsPause) {
-   string text = "=== QUANTUM MATH V6.02 (RANGING REVERSION) ===\n";
+void UpdateDashboard(RegressionResult &m, double atr) {
+   string text = "=== QUANTUM MATH V6.05 (RANGING REVERSION) ===\n";
    text += "Balance: $" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + "\n";
    text += "----------------------------------------\n";
    text += "R-Squared: " + DoubleToString(m.rSquared, 4) + "\n";
@@ -547,14 +519,15 @@ void UpdateDashboard(RegressionResult &m, double atr, bool newsPause) {
    text += "Regime: " + regime + "\n";
    text += "Slope: " + DoubleToString(m.slope, 5) + "\n";
    text += "Volatility (ATR): " + DoubleToString(atr / _Point, 0) + " pts\n";
+   text += "Loss streak: " + IntegerToString(consecLosses);
+   if(MaxConsecutiveLosses > 0)
+      text += " / " + IntegerToString(MaxConsecutiveLosses);
+   text += "\n";
 
-   if(newsPause) text += "STATUS: PAUSED (NEWS DETECTED)\n";
+   if(MaxConsecutiveLosses > 0 && TimeCurrent() < streakBlockUntil)
+      text += "STATUS: STREAK HALT (resume " + TimeToString(streakBlockUntil) + ")\n";
    else if(!CheckTimeFilter()) text += "STATUS: SLEEPING (TIME FILTER)\n";
    else text += "STATUS: HUNTING...\n";
-
-   text += "----------------------------------------\n";
-   text += "Auto-News: " + (UseAutoNews ? "ON" : "OFF") + "\n";
-
    Comment(text);
 }
 
