@@ -53,23 +53,24 @@ expertmode=1
 --- 1. Quantum Math Settings ---=
 LRC_Period=34
 Slope_Threshold=0.05
-R_Squared_Min=0.5
+R2_Max=0.5
+BandMultiplier=2.0
 --- 2. Risk Management ---=
 RiskPercent=0.5
 FixedLot=0.0
 ATR_Period=14
 ATR_Multiplier_SL=2.0
-ATR_Multiplier_TP=3.0
-UseFixedRR=1
-FixedRR=4.0
-EarlyBEThreshold=0
-TrendFilterPeriod=100
-CoolDownBars=0
+PartialRR=2.0
+PartialPct=50.0
+BERR=1.0
+TPRR=4.0
 MaxPositions=1
 MaxHoldMinutes=480
+--- 2b. Optional Trend Confluence ---=
+UseTrendConfluence=0
 --- 3. Auto News Filter (ForexFactory) ---=
 UseAutoNews=1
-IncludeMedium=false
+IncludeMedium=0
 PauseMinsBefore=30
 PauseMinsAfter=30
 ServerTimeOffset=2
@@ -77,11 +78,6 @@ ServerTimeOffset=2
 MaxSpreadPoints=150
 StartHour=8
 EndHour=22
---- 4b. Trailing Stop ---=
-EnableTrailing=false
-TrailingStart=200
-TrailingPercent=10.0
-TrailStep=50
 --- 5. System ---=
 MagicNumber=66666
 </inputs>
@@ -108,4 +104,3 @@ fixed_height=-1
 </indicator>
 </window>
 </chart>
-

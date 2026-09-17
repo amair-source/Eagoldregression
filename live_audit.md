@@ -409,3 +409,28 @@ DEPLOYED (2026-09-10 ~09:50):
 - Account now: balance 4,361.33, equity 4,431.91, margin 60.58.
 - CAVEAT: edge is thin (PF ~1.005-1.007) and LRC-period sensitive; 0.5% risk + riskCap.
   News filter still inactive in live (WebRequest blocked, code -1).
+
+## 2026-09-17 ~18:50 - REFACTOR v6.02: RANGING-REGIME MEAN-REVERSION (user new spec)
+- ENTRY REGIME GATE: entries now BLOCKED when R2 >= 0.5 (strong linear trend). Mean-reversion
+  only allowed in ranging/consolidating regime (R2 < 0.5) with |slope| >= 0.05.
+- ENTRY SIGNAL (N=34 regression, y=Close, x anchored so bar1 -> x=0; correct slope/intercept/R^2/
+  stdDev formulas as spec; bands = regression value +- 2.0*sigma):
+    BUY:  bar2 close BELOW lower band AND bar1 close ABOVE lower band (reversal back inside)
+    SELL: bar2 close ABOVE upper band AND bar1 close BELOW upper band
+  (old logic: single-bar touch-and-reclaim; both retained the channel idea)
+- EXITS REPLACED rigid fixed 1:4 FixedRR with:
+    - BE trigger: SL -> entry once profit >= BERR (1.0R)
+    - Partial:    close PartialPct (50%) of volume at +PartialRR (2.0R); remainder SL -> BE
+    - Remainder:  runs to TP = SLdist * TPRR (4.0R runner target)
+    - MaxHold 480min close kept
+- EXECUTION: ENTRY only on new bar (isNewBar), uses confirmed bar1/bar2 closes (no repaint,
+  no mid-bar re-quote). Lot sizing RiskPercent=0.5% of balance, clamped to VOLUME_MIN/MAX/STEP,
+  notEnoughMoney skip when min-lot risk > 2x cap. Hours 8-22 server (excludes Asian rollover).
+  Conservative spread check (MaxSpreadPoints=150) before entry within new-bar block.
+- Cleaned inputs: removed SL_Mode/SL_GapPoints/SL_FixedPoints/UseFixedRR/FixedRR/EarlyBE
+  Threshold/Risk ramp/trailing/cooldown (dead from prior rewrites); added R2_Max, BandMultiplier,
+  PartialRR, PartialPct, BERR, TPRR, UseTrendConfluence.
+- Compiled clean 0 errors / 0 warnings (ex5 56,016 B, 18:49). Template V6_Guardian_LOT10.tpl
+  rewritten to match new input names (bools as 0/1) + re-synced to GitHub (Eagoldregression).
+- NOTE: NOT yet validated in tester or deployed live. Ranging-gate is a behavioral change from
+  the tuned lrc34 profile (PF ~1.007) - expect fewer trades (strong-trend bars skipped).
